@@ -1,1 +1,33 @@
 /target
+# ── build artifacts ─────────────────────────────────────────
+/target/
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+
+# ── virtual envs ────────────────────────────────────────────
+.env
+.venv
+venv/
+env/
+
+# ── logs & generated result sets ───────────────────────────
+*.log
+*.out
+*.err
+all_errors*.txt
+results*.txt
+sat_result_*.txt
+
+# ── editor / OS junk ───────────────────────────────────────
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+.tmux*
+.screen*
+
+# ── test / coverage cache ──────────────────────────────────
+.cache/
+pytest_cache/
