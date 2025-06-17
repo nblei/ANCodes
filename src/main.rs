@@ -11,11 +11,97 @@ use std::{
     },
     thread,
     time::{Duration, Instant},
+    collections::BTreeMap,
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use an_macros::define_distance_fn;
+/// use an_macros::define_distance_fn;
+
+// ADDED
+/// Miller–Rabin
+fn is_prime(n: u128) -> bool {
+    // Small even / trivial cases first
+    if n < 2 || n & 1 == 0 { return n == 2; }
+
+    // Bases that make MR deterministic for n < 2^128
+    // (Jaeschke 1993, Sorenson–Webster 2015)
+    const BASES: &[u128] =
+        &[2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
+
+    // Write n-1 as d·2^s with d odd
+    let s = (n - 1).trailing_zeros();
+    let d = (n - 1) >> s;
+
+    'next_base: for &a in BASES.iter() {
+        if a >= n { break; }                 // all remaining a >= n are useless
+        let mut x = modpow(a % n, d, n);
+        if x == 1 || x == n - 1 { continue 'next_base; }
+        for _ in 1..s {
+            x = modmul(x, x, n);
+            if x == n - 1 { continue 'next_base; }
+        }
+        return false;                        // definitely composite
+    }
+    true                                      // passed all bases ⇒ prime
+}
+
+/// (Montgomery-less) multiply-mod for u128 – shift/peasant algorithm
+#[inline]
+fn modmul(mut a: u128, mut b: u128, m: u128) -> u128 {
+    let mut r = 0u128;
+    while b != 0 {
+        if b & 1 != 0 { r = (r + a) % m; }
+        a = (a << 1) % m;
+        b >>= 1;
+    }
+    r
+}
+
+/// Modular exponentiation
+fn modpow(mut a: u128, mut e: u128, m: u128) -> u128 {
+    let mut r = 1u128;
+    while e != 0 {
+        if e & 1 != 0 { r = modmul(r, a, m); }
+        a = modmul(a, a, m);
+        e >>= 1;
+    }
+    r
+}
+
+fn enumerate_errors(
+    a: u64,
+    bits: u64,
+    max_weight: usize,
+) -> Vec<(usize, u128, u32)> {
+    let needed_bits = bits + f64::ceil(f64::log2(a as f64)) as u64;
+    let mut out = Vec::new();
+    for w in 1..=max_weight.max(1 << 5) {            // reasonable upper found weight
+        let mut adg = ArithmeticDistanceGenerator::new(w, needed_bits as usize);
+        adg.set_strict(true);
+        let mut found = false;
+        if needed_bits > 64 {
+            for codeword in adg.iter::<u128>() {
+                if codeword % a as u128 == 0 {
+                    out.push((w, codeword, fast_arithmetic_weight(codeword) as u32));
+                    found = true;
+                }
+            }
+        } else {
+            for codeword in adg.iter::<u64>() {
+                if codeword % a == 0 {
+                    let cw = codeword as u128;
+                    out.push((w, cw, fast_arithmetic_weight(cw) as u32));
+                    found = true;
+                }
+            }
+        }
+        if max_weight == 0 && found { break; }       // auto-stop
+        if max_weight != 0 && w == max_weight { break; }
+    }
+    out
+}
+
 
 /// AN Codes Analysis Tool for error detection and correction
 #[derive(Parser)]
@@ -66,6 +152,29 @@ enum Command {
         /// Type of misconstruction analysis to run
         #[arg(value_enum)]
         analysis_type: MisconstructionType,
+    },
+
+    /// Generate all un-detectable errors for a single A up to a given weight
+    /// and print each witness together with its arithmetic weight.
+    GenerateAllErrors {
+        #[arg(short, long, default_value_t = 64)]
+        bits: u64,
+
+        // number of consecutive weight‐classes
+        #[arg(short = 'n', long, default_value_t = 1)]
+        num_weights: usize,
+
+        #[arg(short, long, default_value = "all_errors.txt")]
+        output: PathBuf,
+        
+        #[arg(short, long, default_value_t = num_cpus::get() as u64)]
+        threads: u64,
+
+        #[arg(long, default_value_t = 3_500)]
+        min_a: u64,
+
+        #[arg(long, default_value_t = 1u64 << 17)]
+        max_a: u64,
     },
 }
 
@@ -565,6 +674,11 @@ impl Experiment {
 
                 while idx < max {
                     let a = idx + (thread_id * 2) as u64;
+                    // ADDED
+                    if a > 1 << 17 || !is_prime(a as u128){
+                        idx += num_threads * 2;
+                        continue;
+                    }
                     let ac = AnCode::new(a, bits);
                     if ac.errors[0].len() == 0
                         && ac.errors[1].len() == 0
@@ -793,6 +907,71 @@ fn main() {
                     "Percentage: {:.2}%",
                     (misconstrued as f64 / total as f64) * 100.0
                 );
+            }
+        }
+        Command::GenerateAllErrors { bits, num_weights, threads, min_a, max_a, output } => {
+            let bits       = *bits;
+            let num_weights = *num_weights;
+            let min_a      = *min_a;
+            let max_a      = *max_a;
+            let num_threads = *threads as usize;
+
+            let upper = max_a;
+            let start = if min_a % 2 == 0 { min_a + 1 } else { min_a };
+
+            // Collect primes
+            let primes: Vec<u64> = (start..=upper)
+                .step_by(2)
+                .filter(|&a| is_prime(a as u128))
+                .collect();
+
+            // Partition to threads evenly
+            let chunk_size = (primes.len() + num_threads - 1) / num_threads;
+
+            let f = File::create(output).expect("unable to create output file");
+            let out = Arc::new(Mutex::new(BufWriter::new(f)));
+
+            // Spawn one thread per chunk
+            let handles: Vec<_> = primes
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    let chunk = chunk.to_vec();
+                    let out = Arc::clone(&out);
+                    thread::spawn(move || {
+                        for a in chunk {
+                            // 1) find minimal weight that has an undetectable error
+                            let minimal = enumerate_errors(a, bits, 0);
+                            if minimal.is_empty() { continue; }
+                            let w0 = minimal[0].0;
+                            // 2) find and enumerate errors up to cap weight
+                            let cap = w0 + num_weights.saturating_sub(1);
+                            let all_errs = enumerate_errors(a, bits, cap);
+                            // 3) group
+                            let mut groups: BTreeMap<usize, Vec<u128>> = BTreeMap::new();
+                            for (w_rel, cw, _) in all_errs {
+                                let w_abs = w_rel;
+                                groups.entry(w_abs).or_default().push(cw);
+                            }
+                            // format one line
+                            let mut line = format!("{}, ", a);
+                            for (w, list) in groups {
+                                let codes = list.iter()
+                                    .map(|v| v.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                line.push_str(&format!("{}: {};", w, codes));
+                                line.push(' ');
+                            }
+                            let mut guard = out.lock().unwrap();
+                            writeln!(guard, "{}", line.trim_end()).unwrap();
+                        }
+                    })
+                })
+                .collect();
+
+            // Wait for everyone
+            for h in handles {
+                h.join().unwrap();
             }
         },
     }
